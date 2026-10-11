@@ -1,92 +1,100 @@
-# QuickMeds — SPT 4.1.3
+# BlackHawk QuickMeds — SPT 4.1.6 v1.2.0
 
-Healing that doesn't root you in place.
+Source package for SPT 4.1.6. `build.ps1` compiles against the DLLs from your own SPT installation and does not install or modify SPT.
 
-- **Move while healing** — sprint with a medkit out, walk while splinting, with separate on/off switches for each
-- **Healing speed follows your movement** — faster standing still, slower running
-- **Heal auto cancel** — stops the moment the body part is full instead of finishing the animation for nothing
+## Main features
 
-**Inspired by [SmartAction](https://github.com/yox92/SmartAction) by yox92**, and the auto-cancel idea comes from [Healing Auto Cancel](https://github.com/minihazel/HealingAutoCancel) by minihazel. This is an independent implementation for SPT 4.1.3, not a port of either.
+- Sprint while using normal medicine, with separate walk/sprint controls for splints and surgery.
+- Heal auto-cancel for heal/repair items.
+- Movement-dependent medicine timing + animation, 0.25x–2.50x.
+- Dynamic timing/animation retarget while medicine is already being used.
+- Pill and injector support with grouped category switches.
+- Food/drink are never modified.
+- ContinuousHealing and HealingAutoCancel compatibility retained.
 
-## Installation
-
-Extract into your **SPT root folder** — the one containing `BepInEx\` and `EscapeFromTarkov_Data\`. Files land in `BepInEx\plugins\QuickMeds\`.
-
-**Requires SPT 4.1.3.** Client-only, no server mod.
-
-## Settings
-
-All in the **F12** menu.
+## F12 layout
 
 ### 1. Movement
 
-| Setting | What it does |
-| --- | --- |
-| Sprint while using meds | Run while using bandages, medkits, pills |
-| Walk while using splints or surgery kits | Move at all while splinting or doing surgery |
-| Sprint while using splints or surgery kits | Run while splinting or doing surgery. Needs the walk setting on. |
+- Sprint while using meds
+- Walk while using splints or surgery kits
+- Sprint while using splints or surgery kits
 
-Splints and surgery kits are separated from ordinary meds so you can allow running with a bandage but not while splinting a leg.
+When surgery/splint walking is OFF, the sprint option is forced OFF and its custom F12 control is greyed out/unusable.
 
 ### 2. Healing
 
-| Setting | What it does |
-| --- | --- |
-| Heal auto cancel | Stops as soon as the body part is full, or the item runs out |
-
-A part that is still bleeding keeps healing — otherwise the bleed would undo the work the moment the item was put away. Broken bones always take the full time.
+- Heal auto cancel
 
 ### 3. Healing speed
 
-| Setting | Default | What it does |
-| --- | --- | --- |
-| Adaptive healing speed | on | Master switch for the three speeds below |
-| Speed - standing still | 1.3 | Faster when not moving |
-| Speed - walking | 1.0 | Normal speed |
-| Speed - sprinting | 0.8 | Slower if you run through it |
-| Log details to console | off | Diagnostics, for reporting a problem |
+- Adaptive healing speed
+- Speed - standing still
+- Speed - walking
+- Speed - sprinting
 
-Set all three speeds to 1.00 to keep normal healing times while still using the movement settings.
+### 4. Per-medicine QuickMeds
 
-The sliders stop at 0.70 and 2.50 deliberately. Past that the animation and the healing timer visibly stop lining up, because the game treats them as two separate systems.
+- **All pills** — pill/tablet/capsule medicine. Default OFF.
+- **All injectors** — stimulators/injectors, including Morphine. Default OFF.
+- Medkits and other heal items remain individually selectable — for example AFAK, IFAK, Grizzly, Salewa, CAR, bandages, splints and surgery kits. Balms/ointments and ambiguous/custom medicine also remain individual rather than being guessed into pills/injectors.
 
-**Which items are affected:**
+QuickMeds does not assume `Drugs == pills`: Morphine is a vanilla `Drugs` template but is an injector, while Golden Star/Vaseline-style drugs are balms. Unknown custom drug templates stay individual instead of being guessed.
 
-| | Speed | Animation |
-| --- | --- | --- |
-| Bandages, medkits, splints, surgery kits | yes | yes |
-| Pills, injectors | no | no |
-| Food and drink | no | no |
+The runtime catalog ignores EFT category/base nodes and prefers localized item names for the remaining individual entries.
 
-Pills and injectors are left alone because their timer is how long the *buff* lasts, not how long the injection takes — speeding it up would shorten your painkillers. Food and drink are untouched entirely.
+### 5. Debug
+
+- Debug logging — detailed diagnostics for bug reports. Default OFF.
+
+Debug is bound after the medicine section so it remains the final QuickMeds category in F12.
+
+## Runtime package
+
+After a successful build, the install ZIP contains only:
+
+```text
+BepInEx/
+└─ plugins/
+   └─ QuickMeds/
+      └─ QuickMeds.dll
+```
+
+`README.md`, `TESTING.md`, and build diagnostics stay outside the runtime ZIP. The MIT notice is embedded in the DLL and the readable `LICENSE` remains in this source package.
+
+## Timing design
+
+QuickMeds does not patch EFT's generic health-effect factory. The initial MedEffect `Added` / start-delay stays vanilla. When the exact owned MedEffect reaches `Started`, QuickMeds adjusts the running work duration through EFT's `AddWorkTime(..., reset: true)` path and sets the medicine animator to the same multiplier. Movement/F12 changes during `Started` preserve progress and retarget both together.
 
 ## Compatibility
 
-**Make Meds Great Again** provides the same movement features. If it is installed, QuickMeds detects it and leaves movement to it automatically. The healing features carry on working.
+- Make Meds Great Again: QuickMeds leaves movement overrides to MMGA when detected.
+- HealingAutoCancel: QuickMeds disables only its internal auto-cancel watcher when the external mod is detected.
+- ContinuousHealing 1.6.3: every chained MedEffect is treated as a fresh vanilla-timed effect before QuickMeds applies the current movement target.
+- Fika: local ownership and network-aware timing guards are retained; live co-op verification is still recommended.
 
-**Healing Auto Cancel** — same arrangement. If it is installed, QuickMeds leaves auto-cancel to it.
+## Build
 
-**Modded and backported meds** work with no changes. Item types are identified by their component data, using the same test the game uses on itself, so a backported splint is recognised exactly like a vanilla one. No list of item IDs to maintain.
+Run:
 
-**Fika:** every patch acts only on your own player, and the mod disables itself on a headless client. **Not yet tested in a live co-op raid** — the design is right, but I would rather say so than claim compatibility I have not confirmed.
+```powershell
+.\build.ps1 -SptPath "C:\EFT .0.16.9.5.40743 - SPT 4.1"
+```
 
-## Known limitations
+Successful output is kept under `dist`:
 
-**You can sprint briefly between body parts.** The game clears the "using meds" state in the gaps between limbs, so nothing blocks sprinting there. The only way to close it was to refuse that clear, which broke healing outright — the player reached for the item and got stuck, hands off screen, unable to act. Being able to sprint for a moment between limbs is a fair trade against that.
+```text
+dist\QuickMeds.dll
+dist\BlackHawk-QuickMeds-SPT-4.1.6-v1.2.0.zip
+dist\BUILD-INFO.txt
+```
 
-**A surgery kit used on an arm counts as a surgery item.** The movement settings check what is in your hands, not which body part you are treating. Keeps the whole thing stateless and reliable.
+Only the install ZIP contents belong in SPT. `BUILD-INFO.txt` is for bug reports.
 
-**Changing stance mid-limb adjusts the timing but not the animation.** The animation keeps the speed it was given when that body part started; the next one picks up the new speed. Changing animation speed partway through could restart the put-away clip.
+Do not install a build if the compiler reports any error.
 
-## Uninstalling
+MIT licensed; see `LICENSE`.
 
-Delete `BepInEx\plugins\QuickMeds\`. Nothing is written to your profile.
+## v1.2.0 catalog note
 
----
-
-
-MIT.
-
----
-
-If you'd like to support my work, you can [buy me a coffee](https://ko-fi.com/its_blackhawk) ☕
+The v1.1.7 log exposed a null-resource-key bug in the runtime catalog builder. If an EFT/custom medicine template omitted `Prefab` or `UsePrefab`, catalog binding stopped before individual entries were created. v1.2.0 makes those fields null-safe, so grouped pills/injectors and individual medkits/medical items can coexist in F12.

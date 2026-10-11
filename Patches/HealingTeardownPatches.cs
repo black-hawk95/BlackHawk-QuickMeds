@@ -1,61 +1,76 @@
 using EFT;
 using HarmonyLib;
 using SPT.Reflection.Patching;
+using System;
 using System.Reflection;
 
 namespace QuickMeds.Patches
 {
     /// <summary>
-    /// Cleans up when a heal ends, however it ends.
-    ///
-    /// Two things must not outlive a heal:
-    ///
-    ///   - the animator's playback speed, which is global to the animator rather than to one clip.
-    ///     Left raised, the next weapon draw or reload would play fast.
-    ///   - the health-changed subscription used by auto-cancel, which would otherwise keep firing
-    ///     for the rest of the raid and stay attached to a stale controller after the next one.
-    ///
-    /// HealSpeed.Clear handles both. It is hooked to all three exits - completed, reset, and
-    /// removed - because a heal can end by any of them, and only one of those is the tidy case.
+    /// Teardown is owner-aware. Each hook captures the operation's controller BEFORE EFT runs its
+    /// cleanup, then compares that captured controller to the exact local controller QuickMeds owns.
+    /// A Fika observed player's operation therefore cannot clear local state.
     /// </summary>
     internal class HealingFinishedPatch : ModulePatch
     {
-        protected override MethodBase GetTargetMethod()
-        {
-            return AccessTools.DeclaredMethod(
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.DeclaredMethod(
                 typeof(Player.MedsController.MedsInHandsOperation),
                 nameof(Player.MedsController.MedsInHandsOperation.Finish));
+
+        [PatchPrefix]
+        private static void Prefix(Player.MedsController.MedsInHandsOperation __instance, out Player.MedsController __state)
+        {
+            __state = HealSpeed.GetOperationController(__instance);
         }
 
         [PatchPostfix]
-        private static void Postfix() => HealSpeed.Clear();
+        private static void Postfix(Player.MedsController __state)
+        {
+            try { HealSpeed.ClearIfOwner(__state, "finish"); }
+            catch (Exception ex) { Plugin.LogSource?.LogError($"QuickMeds: finish teardown failed.\n{ex}"); }
+        }
     }
 
-    /// <summary>Cleans up when the operation is reset.</summary>
     internal class HealingResetPatch : ModulePatch
     {
-        protected override MethodBase GetTargetMethod()
-        {
-            return AccessTools.DeclaredMethod(
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.DeclaredMethod(
                 typeof(Player.MedsController.MedsInHandsOperation),
                 nameof(Player.MedsController.MedsInHandsOperation.Reset));
+
+        [PatchPrefix]
+        private static void Prefix(Player.MedsController.MedsInHandsOperation __instance, out Player.MedsController __state)
+        {
+            __state = HealSpeed.GetOperationController(__instance);
         }
 
         [PatchPostfix]
-        private static void Postfix() => HealSpeed.Clear();
+        private static void Postfix(Player.MedsController __state)
+        {
+            try { HealSpeed.ClearIfOwner(__state, "reset"); }
+            catch (Exception ex) { Plugin.LogSource?.LogError($"QuickMeds: reset teardown failed.\n{ex}"); }
+        }
     }
 
-    /// <summary>Cleans up when the operation is removed or interrupted.</summary>
     internal class HealingRemovedPatch : ModulePatch
     {
-        protected override MethodBase GetTargetMethod()
-        {
-            return AccessTools.DeclaredMethod(
+        protected override MethodBase GetTargetMethod() =>
+            AccessTools.DeclaredMethod(
                 typeof(Player.MedsController.MedsInHandsOperation),
                 nameof(Player.MedsController.MedsInHandsOperation.Remove));
+
+        [PatchPrefix]
+        private static void Prefix(Player.MedsController.MedsInHandsOperation __instance, out Player.MedsController __state)
+        {
+            __state = HealSpeed.GetOperationController(__instance);
         }
 
         [PatchPostfix]
-        private static void Postfix() => HealSpeed.Clear();
+        private static void Postfix(Player.MedsController __state)
+        {
+            try { HealSpeed.ClearIfOwner(__state, "remove"); }
+            catch (Exception ex) { Plugin.LogSource?.LogError($"QuickMeds: remove teardown failed.\n{ex}"); }
+        }
     }
 }

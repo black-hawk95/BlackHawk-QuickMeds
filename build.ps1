@@ -55,7 +55,7 @@ if ($missing.Count -gt 0) {
     throw 'Build stopped before compilation. No SPT files were changed.'
 }
 
-# A clean dist prevents old build files from being mistaken for the current build.
+# A clean dist prevents old test files from being mistaken for the current build.
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
@@ -111,7 +111,7 @@ foreach ($generated in @((Join-Path $root 'bin'), (Join-Path $root 'obj'))) {
 
 Write-Host ''
 Write-Host '=====================================================' -ForegroundColor Green
-Write-Host ' BUILD SUCCESSFUL - RELEASE PACKAGE READY' -ForegroundColor Green
+Write-Host ' BUILD SUCCESSFUL - CLEAN RELEASE PACKAGE READY' -ForegroundColor Green
 Write-Host '=====================================================' -ForegroundColor Green
 Write-Host "Standalone DLL: $standaloneDll"
 Write-Host "Install ZIP:    $zip"

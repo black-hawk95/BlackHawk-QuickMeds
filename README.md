@@ -1,6 +1,6 @@
 # BlackHawk QuickMeds — SPT 4.1.6 v1.2.0
 
-Source package for SPT 4.1.6. `build.ps1` compiles against the DLLs from your own SPT installation and does not install or modify SPT.
+Source for the v1.2.0 release for SPT 4.1.6. `build.ps1` compiles against the DLLs from your own SPT installation and does not install or modify SPT.
 
 ## Main features
 
@@ -95,6 +95,6 @@ Do not install a build if the compiler reports any error.
 
 MIT licensed; see `LICENSE`.
 
-## v1.2.0 catalog note
+## v1.2.0 release note
 
-The v1.1.7 log exposed a null-resource-key bug in the runtime catalog builder. If an EFT/custom medicine template omitted `Prefab` or `UsePrefab`, catalog binding stopped before individual entries were created. v1.2.0 makes those fields null-safe, so grouped pills/injectors and individual medkits/medical items can coexist in F12.
+v1.2.0 promotes the tested adaptive timing/animation, per-medicine controls, medicine classification fixes, ContinuousHealing/HealingAutoCancel compatibility, F12 cleanup, and DLL-only runtime packaging into the stable main release. The catalog builder is null-safe for custom medicine templates with missing `Prefab` or `UsePrefab` resource keys.

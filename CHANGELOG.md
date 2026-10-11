@@ -1,14 +1,16 @@
-# v1.2.0 change summary
+# Changelog
 
-This build fixes the F12 catalog failure seen in the 2026-10-11 v1.1.7 log and finalizes the requested menu ordering/defaults. Healing timing, movement retargeting, animator ownership, auto-cancel, Fika/local-player guards, ContinuousHealing compatibility, and HealingAutoCancel compatibility are intentionally unchanged.
+## v1.2.0 — 2026-10-11
 
-## v1.2.0 fixes
+Stable release promoted from the v1.1.x test series. This release combines the adaptive healing/animation rewrite, live movement retargeting, per-medicine controls, compatibility work, catalog fixes, and clean packaging validated during testing.
+
+### Final release fixes
 
 - **Per-medicine catalog crash fixed:** some valid/custom item templates have a null `Prefab` or `UsePrefab`. The v1.1.7 classifier dereferenced those fields and aborted the whole catalog, which is why F12 showed only `All pills` and `All injectors`. Resource paths and debug classification are now null-safe.
 - **Individual healing items are restored:** AFAK, IFAK, Grizzly, Salewa, CAR, splints, surgery kits, balms/ointments, and compatible custom medicine bind as individual F12 toggles after ItemFactory is ready. Pills and injectors remain grouped.
-- **Debug logging is OFF by default for existing pre-release configs too:** v1.2.0 uses a fresh persisted debug key while keeping the visible label `Debug logging`, preventing an old enabled pre-release value from carrying forward.
+- **Debug logging is OFF by default for existing test configs too:** the release retains the fresh persisted debug key introduced in v1.1.9 while keeping the visible label `Debug logging`, preventing an old enabled test value from carrying forward.
 - **Debug is always the final section:** the medicine master settings are bound before the Debug category so ConfigurationManager renders `4. Per-medicine QuickMeds` before `5. Debug`.
-- The v1.1.8 clean runtime packaging and source cleanup are retained.
+- The clean runtime packaging and source cleanup from the test series are retained.
 
 ## Clean runtime package
 

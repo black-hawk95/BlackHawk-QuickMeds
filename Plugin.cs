@@ -273,7 +273,7 @@ namespace QuickMeds
 
             // The config key intentionally changed in v1.1.7 because this setting no longer means
             // "every Drugs item". That also gives the corrected category its requested clean OFF
-            // default even if an older pre-release config saved the previous All pills switch as ON.
+            // default even if an older test config saved the previous All pills switch as ON.
             _allPillsEnabled = Config.Bind(SectionMedicines, "Pills category enabled", false,
                 new ConfigDescription(
                     "Master QuickMeds switch for medicines that actually use pill/tablet/capsule-style application. " +
@@ -287,9 +287,9 @@ namespace QuickMeds
                     null, new ConfigurationManagerAttributes { Order = 99999 }));
 
             // Bind Debug after the medicine section so ConfigurationManager always renders Debug
-            // as the last QuickMeds section. Use a fresh persisted key in v1.2.0 so old pre-release configs
+            // as the last QuickMeds section. Use a fresh persisted key in v1.1.9 so old test configs
             // that had verbose logging enabled do not carry that state forward: debug is OFF by default.
-            _logHealSpeed = Config.Bind(SectionDebug, "Debug logging v1.2.0", false,
+            _logHealSpeed = Config.Bind(SectionDebug, "Debug logging v1.1.9", false,
                 new ConfigDescription(
                     "Detailed QuickMeds diagnostics for bug reports: ownership, medicine classification, item/effect timing, " +
                     "movement retargets, animator writes/readback, compatibility and teardown reasons.",

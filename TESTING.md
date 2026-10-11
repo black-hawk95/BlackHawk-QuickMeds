@@ -1,4 +1,4 @@
-# QuickMeds v1.2.0 — focused regression checklist
+# QuickMeds v1.2.0 — regression checklist
 
 Enable `F12 > QuickMeds > 5. Debug > Debug logging` for the first test.
 

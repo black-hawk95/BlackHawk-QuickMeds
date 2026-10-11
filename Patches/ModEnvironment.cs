@@ -1,62 +1,70 @@
-using Comfort.Common;
+using BepInEx.Bootstrap;
 using EFT;
-using EFT.Hideout;
 using System;
 using System.Linq;
+using System.Reflection;
 
 namespace QuickMeds.Patches
 {
-    /// <summary>
-    /// Shared guards. Every patch in this mod starts with one of these.
-    ///
-    /// Two rules drive the whole design:
-    ///
-    ///  1. Only ever act on the local player. In a Fika raid other players are represented by
-    ///     separate observed-player classes whose healing is replicated from THEIR client. Acting
-    ///     on anyone else would fight that replication and desync their animations.
-    ///
-    ///  2. Do nothing on a headless client. It has no player to heal.
-    /// </summary>
     internal static class ModEnvironment
     {
-        /// <summary>True on a Fika headless client - a server-side client with no player or UI.</summary>
+        private static bool? _isHeadless;
+
+        private static string _mmgaGuid;
+        private static bool _mmgaChecked;
+
+        private static string _autoCancelGuid;
+        private static string _autoCancelVersion;
+        private static bool _autoCancelChecked;
+
+        private static string _continuousHealingGuid;
+        private static string _continuousHealingVersion;
+        private static bool _continuousHealingChecked;
+
+        /// <summary>
+        /// Prefer Fika's real FikaBackendUtils.IsHeadless flag via reflection, so QuickMeds keeps no
+        /// compile-time Fika dependency. Falls back to the legacy GUID heuristic only if that API is
+        /// unavailable.
+        /// </summary>
         public static bool IsHeadlessClient
         {
             get
             {
-                if (_isHeadless.HasValue) return _isHeadless.Value;
+                if (_isHeadless.HasValue)
+                    return _isHeadless.Value;
 
-                // Detected by looking for Fika's headless plugin rather than referencing Fika
-                // directly, so this builds and runs fine without Fika installed.
-                _isHeadless = BepInEx.Bootstrap.Chainloader.PluginInfos.Keys
+                try
+                {
+                    var fikaAssembly = AppDomain.CurrentDomain.GetAssemblies()
+                        .FirstOrDefault(a => string.Equals(a.GetName().Name, "Fika.Core", StringComparison.OrdinalIgnoreCase));
+
+                    var backendType = fikaAssembly?.GetType("Fika.Core.Main.Utils.FikaBackendUtils", false);
+                    var property = backendType?.GetProperty(
+                        "IsHeadless",
+                        BindingFlags.Public | BindingFlags.Static);
+
+                    if (property?.PropertyType == typeof(bool))
+                    {
+                        _isHeadless = (bool)property.GetValue(null);
+                        return _isHeadless.Value;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (Plugin.LogHealSpeed)
+                        Plugin.LogSource?.LogWarning($"QuickMedsDBG: Fika headless reflection failed: {ex.Message}");
+                }
+
+                // Compatibility fallback for older/different dedicated-client packaging.
+                _isHeadless = Chainloader.PluginInfos.Keys
                     .Any(guid => guid.IndexOf("headless", StringComparison.OrdinalIgnoreCase) >= 0);
 
                 return _isHeadless.Value;
             }
         }
 
-        private static bool? _isHeadless;
-
-        /// <summary>
-        /// True when Make Meds Great Again is installed.
-        ///
-        /// MMGA provides the same two movement features by prefixing the same method, so running
-        /// both would mean two prefixes competing over one call. The outcome would be the same
-        /// either way - both refuse the condition - but there is no reason to stack them, so
-        /// QuickMeds stands down and lets MMGA own that part. The healing features are unrelated
-        /// and keep working.
-        /// </summary>
         public static bool IsMmgaInstalled => MmgaGuid != null;
 
-        /// <summary>
-        /// The GUID Make Meds Great Again was found under, or null.
-        ///
-        /// Matched on the name rather than an exact GUID. The published 4.0 source uses
-        /// "com.vinihns.makeMedsGreatAgain", but a later build could change it and there is no way
-        /// to verify a GUID that does not exist yet - so anything containing "makemedsgreatagain"
-        /// counts. The matched value is returned so it can be logged, which makes a wrong match
-        /// visible instead of silent.
-        /// </summary>
         public static string MmgaGuid
         {
             get
@@ -64,60 +72,181 @@ namespace QuickMeds.Patches
                 if (_mmgaChecked) return _mmgaGuid;
                 _mmgaChecked = true;
 
-                _mmgaGuid = BepInEx.Bootstrap.Chainloader.PluginInfos.Keys
+                _mmgaGuid = Chainloader.PluginInfos.Keys
                     .FirstOrDefault(guid =>
-                        guid.Replace(".", string.Empty)
-                            .IndexOf("makemedsgreatagain", StringComparison.OrdinalIgnoreCase) >= 0);
+                        Normalize(guid).IndexOf("makemedsgreatagain", StringComparison.OrdinalIgnoreCase) >= 0);
 
                 return _mmgaGuid;
             }
         }
 
-        private static string _mmgaGuid;
-        private static bool _mmgaChecked;
-
-        /// <summary>True when Healing Auto Cancel is installed.</summary>
-        public static bool IsAutoCancelModInstalled => AutoCancelGuid != null;
-
         /// <summary>
-        /// The GUID Healing Auto Cancel was found under, or null.
-        ///
-        /// Matched on the name for the same reason as MMGA above: a GUID can change between
-        /// versions, and there is no 4.1 build of it yet to check against. If the match ever fails,
-        /// the worst case is that both mods end a heal at the same moment - the second call finds
-        /// the effect already gone and does nothing.
+        /// HealingAutoCancel currently builds with AssemblyName=HealingAutoCancel and BepInEx.PluginInfoProps.
+        /// Match GUID, display name, and loaded plugin assembly name so a harmless metadata change does not
+        /// cause QuickMeds' internal auto-cancel to compete with it.
         /// </summary>
+        public static bool IsAutoCancelModInstalled
+        {
+            get
+            {
+                EnsureAutoCancelDetected();
+                return _autoCancelGuid != null;
+            }
+        }
+
         public static string AutoCancelGuid
         {
             get
             {
-                if (_autoCancelChecked) return _autoCancelGuid;
-                _autoCancelChecked = true;
-
-                _autoCancelGuid = BepInEx.Bootstrap.Chainloader.PluginInfos.Keys
-                    .FirstOrDefault(guid =>
-                        guid.Replace(".", string.Empty)
-                            .IndexOf("healingautocancel", StringComparison.OrdinalIgnoreCase) >= 0);
-
+                EnsureAutoCancelDetected();
                 return _autoCancelGuid;
             }
         }
 
-        private static string _autoCancelGuid;
-        private static bool _autoCancelChecked;
-
-        /// <summary>True when the player is in a raid rather than the hideout.</summary>
-        public static bool IsInRaid =>
-            Singleton<GameWorld>.Instantiated && Singleton<GameWorld>.Instance is not HideoutGameWorld;
+        public static string AutoCancelVersion
+        {
+            get
+            {
+                EnsureAutoCancelDetected();
+                return _autoCancelVersion;
+            }
+        }
 
         /// <summary>
-        /// True only for the local, living player. This is THE guard for multiplayer safety, and
-        /// every gameplay patch calls it before touching anything.
+        /// Lacyway ContinuousHealing uses the stable GUID com.lacyway.ch. We also match its display/assembly
+        /// identity for defensive compatibility with repacks. QuickMeds does not patch ContinuousHealing;
+        /// this flag is diagnostics plus effect-boundary handling only.
         /// </summary>
+        public static bool IsContinuousHealingInstalled
+        {
+            get
+            {
+                EnsureContinuousHealingDetected();
+                return _continuousHealingGuid != null;
+            }
+        }
+
+        public static string ContinuousHealingGuid
+        {
+            get
+            {
+                EnsureContinuousHealingDetected();
+                return _continuousHealingGuid;
+            }
+        }
+
+        public static string ContinuousHealingVersion
+        {
+            get
+            {
+                EnsureContinuousHealingDetected();
+                return _continuousHealingVersion;
+            }
+        }
+
+        private static void EnsureAutoCancelDetected()
+        {
+            if (_autoCancelChecked)
+                return;
+
+            _autoCancelChecked = true;
+            DetectPlugin(
+                exactGuid: "HealingAutoCancel",
+                normalizedTokens: new[] { "healingautocancel", "improvedselfcare" },
+                out _autoCancelGuid,
+                out _autoCancelVersion);
+        }
+
+        private static void EnsureContinuousHealingDetected()
+        {
+            if (_continuousHealingChecked)
+                return;
+
+            _continuousHealingChecked = true;
+            DetectPlugin(
+                exactGuid: "com.lacyway.ch",
+                normalizedTokens: new[] { "continuoushealing" },
+                out _continuousHealingGuid,
+                out _continuousHealingVersion);
+        }
+
+        private static void DetectPlugin(
+            string exactGuid,
+            string[] normalizedTokens,
+            out string matchedGuid,
+            out string matchedVersion)
+        {
+            matchedGuid = null;
+            matchedVersion = null;
+
+            string[] normalizedNeedles = normalizedTokens == null
+                ? Array.Empty<string>()
+                : normalizedTokens
+                    .Select(Normalize)
+                    .Where(token => !string.IsNullOrEmpty(token))
+                    .ToArray();
+
+            foreach (var pair in Chainloader.PluginInfos)
+            {
+                var info = pair.Value;
+                string metadataGuid = info?.Metadata?.GUID;
+                string metadataName = info?.Metadata?.Name;
+                string assemblyName = null;
+
+                try
+                {
+                    assemblyName = info?.Instance?.GetType().Assembly.GetName().Name;
+                }
+                catch
+                {
+                    // Metadata/key matching below is enough if an unusual loader proxy blocks assembly access.
+                }
+
+                bool exact =
+                    string.Equals(pair.Key, exactGuid, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(metadataGuid, exactGuid, StringComparison.OrdinalIgnoreCase);
+
+                bool tokenMatch = false;
+                if (!exact && normalizedNeedles.Length > 0)
+                {
+                    string[] candidates = { pair.Key, metadataGuid, metadataName, assemblyName };
+
+                    foreach (string candidate in candidates)
+                    {
+                        string normalized = Normalize(candidate);
+                        if (string.IsNullOrEmpty(normalized))
+                            continue;
+
+                        if (normalizedNeedles.Any(token =>
+                            normalized.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0))
+                        {
+                            tokenMatch = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!exact && !tokenMatch)
+                    continue;
+
+                matchedGuid = !string.IsNullOrEmpty(metadataGuid) ? metadataGuid : pair.Key;
+                matchedVersion = info?.Metadata?.Version?.ToString() ?? "unknown";
+                return;
+            }
+        }
+
+        private static string Normalize(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return string.Empty;
+
+            return new string(value.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
+        }
+
         public static bool IsLocalLivingPlayer(Player player)
         {
-            if (player == null) return false;
-            if (!player.IsYourPlayer) return false;
+            if (player == null || !player.IsYourPlayer)
+                return false;
 
             var health = player.ActiveHealthController;
             return health != null && health.IsAlive;

@@ -5,70 +5,65 @@ using HarmonyLib;
 using SPT.Reflection.Patching;
 using System;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 
 namespace QuickMeds.Patches
 {
     /// <summary>
-    /// Healing speed that follows how still you are.
+    /// Owns exactly one LOCAL player's medicine session.
     ///
-    /// The game drives both halves of a heal from a single factor: GoNextBodyPart hands it to the
-    /// animator as SetUseTimeMultiplier(X), and DoMedEffect sets the effect's work time to
-    /// baseTime / X. So the multiplier is folded into that same factor - the animation multiplied
-    /// by M, the duration divided by M.
-    ///
-    /// Which items are affected, and why they differ:
-    ///
-    ///   bandages, medkits, splints, surgery kits   animation + duration
-    ///   pills, injectors                           animation only
-    ///   food, drink                                neither
-    ///
-    /// Pills and injectors get the animation but not the duration because a stimulator's
-    /// WorkStateTime is how long its BUFF lasts, not how long you spend injecting it. Scaling that
-    /// would shorten your painkillers rather than speed up the injection.
-    ///
-    /// Food and drink are excluded outright - eating faster because you stood still is not what
-    /// this mod is for.
-    ///
-    /// Item types are told apart by their COMPONENTS, never by a list of ids. Meds added by other
-    /// mods - including content backports - therefore work with no changes, because a backported
-    /// medkit still carries a MedKitComponent.
+    /// Important invariants:
+    ///  - remote/Fika observed players are rejected before any shared state is touched;
+    ///  - QuickMeds never patches EFT's generic AddEffect<T> factory (it is used during player spawn);
+    ///  - the vanilla start-delay portion stays at 1.0x, then work timing + animation switch together at MedEffect.Started;
+    ///  - only the exact controller/item/effect owned by the current local session can be changed;
+    ///  - animator writes are absolute (never multiplied on top of a previous QuickMeds value);
+    ///  - every medicine uses the same F12 selection gate across start, retarget and animation;
+    ///  - pills/injectors use category switches; other medicine can still be controlled per template;
+    ///  - food/drink remain vanilla.
     /// </summary>
     internal static class HealSpeed
     {
-        /// <summary>Multiplier for the body part being healed. Above 1 is faster.</summary>
-        public static float Current { get; private set; } = 1f;
+        private const float Epsilon = 0.001f;
+        private const float MinMultiplier = 0.25f;
+        private const float MaxMultiplier = 2.5f;
 
-        /// <summary>True while a heal this mod is influencing is in progress.</summary>
-        public static bool Active { get; private set; }
+        private static readonly FieldInfo OperationControllerField =
+            AccessTools.Field(typeof(Player.MedsController.MedsInHandsOperation), "_controller");
 
-        /// <summary>
-        /// The effect for the body part currently being healed.
-        ///
-        /// Captured from DoMedEffect's RETURN VALUE rather than by searching the health
-        /// controller's active-effect list. The search approach worked only for surgery kits: every
-        /// other med starts with a delay and is not in that list yet at the moment this runs, so
-        /// the search came back empty and the speed was never applied. The return value is the
-        /// effect, immediately, for every item type.
-        /// </summary>
-        public static ActiveHealthController.MedEffect CurrentEffect { get; private set; }
-
+        private static Player _ownerPlayer;
         private static Player.MedsController _controller;
+        private static Item _item;
+        private static ActiveHealthController.MedEffect _currentEffect;
+        private static bool _awaitingEffect;
+        private static float _effectMultiplier = 1f;
 
-        public static void CaptureEffect(ActiveHealthController.MedEffect effect) => CurrentEffect = effect;
+        private static bool _animatorSpeedApplied;
+        private static float _animatorBaseline = 1f;
+        private static float _lastAnimatorWrite = 1f;
 
-        /// <summary>Works out the multiplier for the current movement state.</summary>
-        public static float Evaluate(Player player)
+        public static float Current { get; private set; } = 1f;
+        public static bool IsTracking => _ownerPlayer != null && _controller != null;
+
+        public static float Evaluate(Player player, Item item = null)
         {
-            if (!Plugin.AdaptiveHealSpeed) return 1f;
-            if (!ModEnvironment.IsLocalLivingPlayer(player)) return 1f;
+            item ??= _item;
 
-            // The animation state is how the game itself describes movement; there is no single
-            // "current speed" value to read.
+            if (!Plugin.AdaptiveHealSpeed || !Plugin.AdaptiveHealSpeedAvailable)
+                return 1f;
+
+            if (!Plugin.IsMedicineEnabled(item))
+                return 1f;
+
+            if (!ModEnvironment.IsLocalLivingPlayer(player))
+                return 1f;
+
             var state = player.MovementContext?.CurrentState?.Name;
-            if (state == null) return 1f;
+            if (state == null)
+                return 1f;
 
-            return state.Value switch
+            float value = state.Value switch
             {
                 EPlayerState.None or
                 EPlayerState.Idle or
@@ -76,436 +71,619 @@ namespace QuickMeds.Patches
                 EPlayerState.Transition => Plugin.StillHealSpeed,
 
                 EPlayerState.Sprint => Plugin.SprintHealSpeed,
-
                 _ => Plugin.WalkHealSpeed,
             };
+
+            // Config ranges normally clamp this already. Clamp again because users can hand-edit
+            // cfg files and because timing must never receive zero/negative/non-finite values.
+            if (float.IsNaN(value) || float.IsInfinity(value))
+                return 1f;
+
+            return Mathf.Clamp(value, MinMultiplier, MaxMultiplier);
         }
 
-        /// <summary>Food and drink are left entirely alone.</summary>
         public static bool IsFoodOrDrink(Item item)
         {
             return item != null && item.TryGetItemComponent<FoodDrinkComponent>(out _);
         }
 
         /// <summary>
-        /// True for items whose work time is genuinely "how long you spend applying this" -
-        /// bandages, medkits, splints, surgery kits. For a stimulator the work time is the buff
-        /// duration instead, so its duration must not be scaled.
+        /// Adaptive-speed ownership accepts EFT medicine items, including Drugs (pills) and
+        /// Stimulator (injectors). Whether the current medicine is scaled is decided by
+        /// Plugin.IsMedicineEnabled so every path uses the same F12 gate.
         /// </summary>
-        public static bool HasApplicationDuration(Item item)
+        public static bool IsMedicineItem(Item item)
         {
-            return item != null && item.TryGetItemComponent<MedKitComponent>(out _);
+            return item is Meds && !IsFoodOrDrink(item);
+        }
+
+        /// <summary>
+        /// Auto-cancel intentionally stays limited to repair/heal items. Pills/injectors can have
+        /// timed effects that are not equivalent to filling a body part, so they must never inherit
+        /// the medkit stop-when-full heuristic just because adaptive speed supports them.
+        /// </summary>
+        public static bool IsAutoCancelItem(Item item)
+        {
+            return IsMedicineItem(item) && item is not Drugs && item is not Stimulator;
         }
 
         public static void Begin(Player player, Player.MedsController controller)
         {
-            CurrentEffect = null;
-            _controller = controller;
-
-            var item = controller?.Item;
-
-            // Reset FIRST, before any decision below can return early.
-            //
-            // Animator.speed persists until something changes it, so every path into this method
-            // has to start from a known state. Without this, food and drink inherited whatever
-            // speed the previous heal left set, and a multi-limb sequence carried its speed from
-            // one body part into the next - which is where the runaway animation came from.
-            ResetAnimatorSpeed();
-
-            // Food and drink are never touched.
-            if (IsFoodOrDrink(item))
+            try
             {
+                // Critical Fika rule: reject remote players BEFORE touching any static state.
+                if (!ModEnvironment.IsLocalLivingPlayer(player) || controller == null)
+                {
+                    Debug($"BEGIN ignored remote/invalid player controller={Id(controller)}");
+                    return;
+                }
+
+                // A genuinely new controller means the previous local session did not tear down
+                // cleanly. Restore only what QuickMeds itself still owns before taking new ownership.
+                if (_controller != null && !ReferenceEquals(_controller, controller))
+                {
+                    Debug($"BEGIN owner switch old={Id(_controller)} new={Id(controller)}; cleaning old session");
+                    ClearInternal("owner-switch");
+                }
+
+                _ownerPlayer = player;
+                _controller = controller;
+                _item = controller.Item;
+                _currentEffect = null;
+                _awaitingEffect = true;
+                _effectMultiplier = 1f;
+
+                // Every new body-part application begins with EFT's vanilla start-delay timing.
+                // If a previous limb left QuickMeds owning Animator.speed on the same controller,
+                // release it now so the delay and animation remain aligned at 1.0x.
+                RestoreAnimatorIfOwned("begin-delay");
+
+                if (!IsMedicineItem(_item))
+                {
+                    Current = 1f;
+                    RestoreAnimatorIfOwned("begin-excluded");
+                    _awaitingEffect = false;
+                    Debug($"BEGIN excluded item={ItemName()} type={_item?.GetType().Name ?? "null"}");
+                    return;
+                }
+
+                Current = Evaluate(player, _item);
+
+                // Do not speed the animation during MedEffect.Added. EFT's start delay is still
+                // vanilla, so changing Animator.speed here would make the visible action outrun
+                // the health effect. We switch both at MedEffect.Started instead.
+                Debug($"ANIM deferred until effect-started target={Current:0.00} reads={ReadAnimatorSpeed(controller):0.000}");
+
+                // Auto-cancel is independent from adaptive speed and still works at 1.0x/off.
+                HealAutoCancel.Watch(player, _item);
+
+                Debug(
+                    $"BEGIN ownerPlayer=true controller={Id(controller)} item={ItemName()} " +
+                    $"type={_item?.GetType().Name ?? "null"} move={MovementName(player)} mult={Current:0.00} " +
+                    $"selected={Plugin.IsMedicineEnabled(_item)} adaptive={Plugin.AdaptiveHealSpeed} " +
+                    $"timingAvailable={Plugin.AdaptiveHealSpeedAvailable}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogSource?.LogError($"QuickMeds: Begin failed; session cleared safely.\n{ex}");
+                ClearInternal("begin-exception");
+            }
+        }
+
+        public static void CaptureEffect(
+            ActiveHealthController health,
+            Item item,
+            ActiveHealthController.MedEffect effect)
+        {
+            if (effect == null)
+                return;
+
+            if (!OwnsHealthController(health) || !MatchesItem(item) || !IsMedicineItem(item))
+            {
+                Debug(
+                    $"CAPTURE ignored healthMatch={OwnsHealthController(health)} itemMatch={MatchesItem(item)} " +
+                    $"item={item?.TemplateId.ToString() ?? "null"} effect={EffectSummary(effect)}");
+                return;
+            }
+
+            // The effect is initialized with its MedItem before DoMedEffect returns. Verify it is the
+            // exact item we own; this prevents an unrelated MedEffect from replacing local state.
+            if (effect.MedItem != null && !ReferenceEquals(effect.MedItem, _item) && !SameItemId(effect.MedItem, _item))
+            {
+                Debug($"CAPTURE rejected mismatched MedItem effectItem={effect.MedItem.TemplateId} ownerItem={ItemName()}");
+                return;
+            }
+
+            AdoptEffect(effect, "capture");
+            _awaitingEffect = false;
+            Debug($"CAPTURE {EffectSummary(effect)} target={Current:0.00} applied={_effectMultiplier:0.00}");
+
+            // Zero-delay medicines can already be Started before DoMedEffect returns. The dedicated
+            // Started postfix normally handles them, but this is a safe idempotent fallback.
+            if (effect.State == EEffectState.Started)
+                ApplyStartedTarget(effect, "capture-started");
+        }
+
+        public static bool OwnsHealthController(ActiveHealthController health)
+        {
+            return IsTracking && health != null && ReferenceEquals(_ownerPlayer.ActiveHealthController, health);
+        }
+
+        public static bool MatchesItem(Item item)
+        {
+            if (_item == null || item == null)
+                return false;
+
+            return ReferenceEquals(_item, item) || SameItemId(_item, item);
+        }
+
+        private static bool SameItemId(Item left, Item right)
+        {
+            if (left == null || right == null) return false;
+            return string.Equals(left.Id.ToString(), right.Id.ToString(), StringComparison.Ordinal);
+        }
+
+        public static bool OwnsAnimator(FirearmsAnimator animator)
+        {
+            return animator != null && _controller?.FirearmsAnimator != null &&
+                   ReferenceEquals(_controller.FirearmsAnimator, animator);
+        }
+
+        public static void Retarget(Player player, string source = "movement")
+        {
+            try
+            {
+                if (!ModEnvironment.IsLocalLivingPlayer(player))
+                    return;
+
+                if (!ReferenceEquals(player, _ownerPlayer))
+                {
+                    Debug($"RETARGET ignored non-owner local reference source={source}");
+                    return;
+                }
+
+                if (player.HandsController is not Player.MedsController controller ||
+                    !ReferenceEquals(controller, _controller))
+                {
+                    Debug($"RETARGET skipped controller mismatch source={source} live={Id(player.HandsController)} owner={Id(_controller)}");
+                    return;
+                }
+
+                if (!IsMedicineItem(controller.Item) || !MatchesItem(controller.Item))
+                {
+                    Debug($"RETARGET skipped excluded/mismatched item source={source}");
+                    return;
+                }
+
+                var effect = FindOwnedMedEffect(player, controller.Item) ?? _currentEffect;
+                if (effect != null && (effect.State == EEffectState.Residued || effect.State == EEffectState.Removed))
+                {
+                    Debug($"RETARGET skipped teardown state={effect.State} source={source}");
+                    return;
+                }
+
+                float updated = Evaluate(player, controller.Item);
+
+                // During the vanilla Added/start-delay phase we only remember the newest target.
+                // Animator.speed stays at its baseline so the visible delay stays synchronized.
+                if ((effect != null && effect.State == EEffectState.Added) || (effect == null && _awaitingEffect))
+                {
+                    float deferredFrom = Current;
+                    Current = updated;
+                    Debug(
+                        $"RETARGET deferred until Started source={source} move={MovementName(player)} " +
+                        $"target={deferredFrom:0.00}->{updated:0.00} animator={ReadAnimatorSpeed(controller):0.000}");
+                    return;
+                }
+
+                if (effect == null)
+                {
+                    Debug($"RETARGET skipped: no owned effect source={source}");
+                    return;
+                }
+
+                if (effect.State != EEffectState.Started)
+                {
+                    Debug($"RETARGET skipped unsupported state={effect.State} source={source}");
+                    return;
+                }
+
+                float previousTarget = Current;
+                float previousApplied = _effectMultiplier;
+
+                if (Math.Abs(updated - _effectMultiplier) > Epsilon)
+                {
+                    Rescale(effect, _effectMultiplier, updated);
+                    _effectMultiplier = updated;
+                }
+
+                Current = updated;
+                ApplyAnimatorSpeed(controller, updated, $"retarget:{source}");
+
+                if (Math.Abs(updated - previousTarget) <= Epsilon &&
+                    Math.Abs(updated - previousApplied) <= Epsilon)
+                {
+                    Debug($"RETARGET unchanged source={source} move={MovementName(player)} mult={updated:0.00}");
+                    return;
+                }
+
+                Debug(
+                    $"RETARGET applied source={source} move={MovementName(player)} " +
+                    $"target={previousTarget:0.00}->{updated:0.00} effect={previousApplied:0.00}->{_effectMultiplier:0.00} " +
+                    $"state={EffectSummary(effect)}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogSource?.LogError($"QuickMeds: Retarget failed; adaptive speed disabled for safety.\n{ex}");
+                Plugin.DisableAdaptiveHealSpeed();
+                RestoreAnimatorIfOwned("retarget-exception");
                 Current = 1f;
-                Active = false;
-                return;
+                _effectMultiplier = 1f;
             }
+        }
 
-            Current = Evaluate(player);
-            Active = Math.Abs(Current - 1f) > 0.001f;
+        public static void RefreshFromSettings(string source)
+        {
+            var player = _ownerPlayer;
+            if (player == null)
+                return;
 
-            // Pills, injectors, food and drink are left completely alone - no duration change and
-            // no animation change.
-            //
-            // Their work time is the BUFF duration rather than how long the action takes, so it
-            // must not be scaled, and scaling only the animation would show a fast animation over
-            // an action whose length never changed. Touching them also gained nothing and was a
-            // suspect in the put-away animation glitch.
-            //
-            // One rule throughout: animation and duration move together, or neither moves.
-            if (!HasApplicationDuration(item))
+            Retarget(player, source);
+        }
+
+        /// <summary>
+        /// Refreshes a live medicine session only when the setting that changed actually applies
+        /// to the item currently in the player's hands. This keeps category toggles (all pills /
+        /// all injectors) from generating unrelated retargets for an active medkit or surgery kit.
+        /// </summary>
+        public static void RefreshFromSettingsIfCurrentItem(string source, Func<Item, bool> predicate)
+        {
+            var item = _item;
+            if (item == null || predicate == null || !predicate(item))
+                return;
+
+            RefreshFromSettings(source);
+        }
+
+        public static void OnEffectStarted(ActiveHealthController.MedEffect effect)
+        {
+            try
             {
+                if (effect == null || !IsTracking)
+                    return;
+
+                if (effect.MedItem == null || !MatchesItem(effect.MedItem))
+                    return;
+
+                if (!IsExactOwnedEffectLive(effect))
+                {
+                    Debug($"EFFECT started ignored: ownership mismatch effect={EffectSummary(effect)}");
+                    return;
+                }
+
+                AdoptEffect(effect, "started");
+                _awaitingEffect = false;
+                Debug($"EFFECT started {EffectSummary(effect)} target={Current:0.00} applied={_effectMultiplier:0.00}");
+                ApplyStartedTarget(effect, "effect-started");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogSource?.LogError($"QuickMeds: effect-started retarget failed; adaptive speed disabled.\n{ex}");
+                Plugin.DisableAdaptiveHealSpeed();
+                RestoreAnimatorIfOwned("effect-started-exception");
                 Current = 1f;
-                Active = false;
-                return;
+                _effectMultiplier = 1f;
             }
-
-            ApplyAnimatorSpeed();
-
-            HealAutoCancel.Watch(player, item);
         }
 
-        public static void Clear()
+        private static void ApplyStartedTarget(ActiveHealthController.MedEffect effect, string source)
         {
-            // The animator speed MUST be restored before the controller reference is dropped.
-            //
-            // SetAnimationSpeed sets Animator.speed, which scales the whole animator rather than
-            // one clip. If it were left raised, every later animation on that object - drawing a
-            // weapon, reloading - would play fast too. This is why Clear is called from every path
-            // out of a heal, completed or interrupted.
-            ResetAnimatorSpeed();
-            HealAutoCancel.Unwatch();
+            if (effect == null || effect.State != EEffectState.Started || _controller == null)
+                return;
 
+            float target = Evaluate(_ownerPlayer, _item);
+            float previousApplied = _effectMultiplier;
 
-            Active = false;
-            Current = 1f;
-            CurrentEffect = null;
-            _controller = null;
+            if (Math.Abs(target - previousApplied) > Epsilon)
+            {
+                Rescale(effect, previousApplied, target);
+                _effectMultiplier = target;
+            }
+
+            Current = target;
+            ApplyAnimatorSpeed(_controller, target, source);
+
+            Debug(
+                $"STARTED target source={source} applied={previousApplied:0.00}->{_effectMultiplier:0.00} " +
+                $"move={MovementName(_ownerPlayer)} animator={ReadAnimatorSpeed(_controller):0.000} " +
+                $"effect={EffectSummary(effect)}");
         }
 
         /// <summary>
-        /// Scales the animator's playback speed to match the healing speed.
+        /// Takes ownership of a newly-created MedEffect without assuming GoNextBodyPart ran first.
+        /// ContinuousHealing starts the next limb directly with DoMedEffect() from OnEffectRemoved,
+        /// so the MedsController/item can stay the same while the effect object changes underneath it.
         ///
-        /// This is separate from SetUseTimeMultiplier, and does a different job. That method sets
-        /// an animator FLOAT PARAMETER (FLOAT_USETIMEMULTIPLIER) which the animation controller
-        /// only uses if its state machine was authored to read it - which is why passing 2.5 to it
-        /// arrived correctly and changed nothing visible. SetAnimationSpeed sets Animator.speed
-        /// directly, which scales clip playback regardless of how the controller was built.
-        ///
-        /// Both are applied: the float parameter for anything the controller does read it for, and
-        /// the playback speed for the visible result.
+        /// A new EFT MedEffect always begins from vanilla 1.0x timing. Resetting the per-effect applied
+        /// multiplier here prevents the next limb from inheriting the previous limb's multiplier. The
+        /// animator is released to its saved baseline during any Added/start-delay phase; Started then
+        /// applies the current movement target to both timing and animation together.
         /// </summary>
-        /// <summary>
-        /// Every animation-speed change goes through here, tagged with where it came from.
-        ///
-        /// The put-away animation replaying has now been blamed on two different calls and neither
-        /// fix worked, so instead of guessing a third time this records every call: which one, what
-        /// value, what the animator actually reads back, and how far through the effect it landed.
-        /// The call immediately before the glitch is the culprit.
-        /// </summary>
-        private static void SetSpeed(string source, float value)
+        private static void AdoptEffect(ActiveHealthController.MedEffect effect, string source)
         {
-            var animator = _controller?.FirearmsAnimator;
-            if (animator == null) return;
-
-            animator.SetAnimationSpeed(value);
-
-            if (!Plugin.LogHealSpeed) return;
-
-            var effect = CurrentEffect;
-            var elapsed = effect?.StateCurrentTime ?? -1f;
-            var total = effect?.WorkStateTime ?? -1f;
-            var state = effect == null ? "-" : effect.State.ToString();
-
-            Plugin.LogSource?.LogInfo(
-                $"QuickMeds: anim-speed [{source}] set={value:0.00} reads={ReadAnimatorSpeed():0.00} " +
-                $"item={ItemName()} state={state} elapsed={elapsed:0.00}/{total:0.00}");
-        }
-
-        private static string ItemName()
-        {
-            var id = _controller?.Item?.TemplateId.ToString();
-            return string.IsNullOrEmpty(id) ? "none" : id;
-        }
-
-        public static void ApplyAnimatorSpeed()
-        {
-            var animator = _controller?.FirearmsAnimator;
-            if (animator == null) return;
-
-            // Reset to 1 FIRST, then apply.
-            //
-            // Animator.speed persists until something changes it, and this runs once per body
-            // part. Applying the multiplier to whatever was already there means a multi-limb heal
-            // stacks it: 2.5, then 6.25, then 15.6. That is the runaway animation on a surgery kit
-            // treating several parts - and it also explains the animation finishing seconds before
-            // the healing, since it was running roughly four times too fast.
-            //
-            // Resetting first makes every body part start from a known state.
-            SetSpeed("reset", 1f);
-            SetSpeed("apply", Current);
-            _animatorSpeedApplied = true;
-        }
-
-        /// <summary>
-        /// The animator's ACTUAL playback speed, rather than what this mod believes it set.
-        ///
-        /// Worth logging separately: the two disagreeing is exactly how the stacking above went
-        /// unnoticed.
-        /// </summary>
-        private static float ReadAnimatorSpeed()
-        {
-            var animator = _controller?.FirearmsAnimator?.Animator;
-            return animator?.speed ?? -1f;
-        }
-
-        /// <summary>Returns the animator to normal speed.</summary>
-        public static void ResetAnimatorSpeed()
-        {
-            // Only reset if a speed was actually applied.
-            //
-            // This used to run for EVERY item, including pills, stims, food and drink - which the
-            // mod otherwise leaves completely alone. Writing to the animator as the put-away
-            // animation began restarted that clip, which is the item being visibly put away twice.
-            // Nothing was ever changed for those items, so there was nothing to undo.
-            if (!_animatorSpeedApplied) return;
-
-            _animatorSpeedApplied = false;
-            SetSpeed("teardown", 1f);
-        }
-
-        /// <summary>True once this mod has changed the animator speed for the current heal.</summary>
-        private static bool _animatorSpeedApplied;
-
-        /// <summary>
-        /// Applies a new multiplier to a heal already in progress. Called when the player starts or
-        /// stops moving; does nothing unless the multiplier actually changed.
-        /// </summary>
-        public static void Retarget(Player player)
-        {
-            // Logged FIRST, before any early return.
-            //
-            // Four versions were built on the assumption that this method runs when the player
-            // changes stance, and none of them worked - but nothing ever logged from inside here,
-            // so there was no proof it runs at all. If these lines never appear, the movement hook
-            // is the problem and everything downstream of it was fine.
-            if (Plugin.LogHealSpeed)
-            {
-                var handsType = player?.HandsController?.GetType().Name ?? "null";
-                Plugin.LogSource?.LogInfo(
-                    $"QuickMeds: RETARGET called - hands={handsType} " +
-                    $"state={player?.MovementContext?.CurrentState?.Name.ToString() ?? "?"} " +
-                    $"current={Current:0.00} adaptive={Plugin.AdaptiveHealSpeed}");
-            }
-
-            if (!Plugin.AdaptiveHealSpeed) return;
-
-            // Everything below is read LIVE from the player rather than from stored fields.
-            //
-            // The stored controller and effect were being wiped mid-heal: logging showed Clear()
-            // running between body parts, not just at the end, so by the time a stance change
-            // arrived those fields were already null and this returned immediately. That is why
-            // mid-heal speed changes stopped working for every item.
-            //
-            // Reading live removes the dependency altogether. It no longer matters when Clear()
-            // runs, or which of the teardown hooks fires per limb - the state cannot be stale
-            // because it is not kept.
-            if (player.HandsController is not Player.MedsController controller)
-            {
-                if (Plugin.LogHealSpeed) Plugin.LogSource?.LogInfo("QuickMeds: retarget skipped - not holding meds");
+            if (effect == null)
                 return;
-            }
 
-            var item = controller.Item;
-            if (IsFoodOrDrink(item))
+            if (_currentEffect != null && !ReferenceEquals(_currentEffect, effect))
             {
-                if (Plugin.LogHealSpeed) Plugin.LogSource?.LogInfo("QuickMeds: retarget skipped - food or drink");
-                return;
+                var previous = _currentEffect;
+                float previousApplied = _effectMultiplier;
+
+                RestoreAnimatorIfOwned($"effect-boundary:{source}");
+                _effectMultiplier = 1f;
+
+                Debug(
+                    $"EFFECT boundary source={source} oldId={previous.Id} oldState={previous.State} " +
+                    $"newId={effect.Id} newState={effect.State} applied={previousApplied:0.00}->1.00 " +
+                    $"continuousHealing={ModEnvironment.IsContinuousHealingInstalled}");
+
+                if (ModEnvironment.IsContinuousHealingInstalled)
+                {
+                    Debug(
+                        $"COMPAT ContinuousHealing chained effect old={previous.Id} new={effect.Id}; " +
+                        "new effect starts from vanilla timing");
+                }
             }
 
-            // Nothing here applies to an item whose duration is not scaled.
-            //
-            // Pills and injectors keep their timing, because their work time is the buff duration
-            // rather than how long the injection takes. Touching the animator for them was pure
-            // downside: no benefit, and re-applying an animation speed as the put-away animation
-            // began made that animation restart - the "pill put away twice" bug.
-            //
-            // The rule is the same one Begin follows: animation and duration move together, or
-            // neither moves.
-            if (!HasApplicationDuration(item))
-            {
-                if (Plugin.LogHealSpeed) Plugin.LogSource?.LogInfo("QuickMeds: retarget skipped - item timing not scaled");
-                return;
-            }
-
-            var updated = Evaluate(player);
-            if (Math.Abs(updated - Current) < 0.001f)
-            {
-                if (Plugin.LogHealSpeed)
-                    Plugin.LogSource?.LogInfo($"QuickMeds: retarget skipped - speed unchanged ({Current:0.00})");
-                return;
-            }
-
-            // Live lookup first, with the effect captured from DoMedEffect as a fallback.
-            //
-            // The live search returns null for most meds, because at that moment the effect is not
-            // yet in the health controller's active list - the same reason an earlier version only
-            // worked for surgery kits. The captured value is the reliable one; the live search is
-            // kept because it stays correct if the captured effect is stale.
-            var effect = FindActiveMedEffect(player) ?? CurrentEffect;
-
-            if (Plugin.LogHealSpeed)
-            {
-                Plugin.LogSource?.LogInfo(
-                    $"QuickMeds: RETARGET applying {Current:0.00} -> {updated:0.00} " +
-                    $"effect={(effect == null ? "NULL" : "found")}");
-            }
-
-            if (effect != null)
-            {
-                Rescale(effect, Current, updated);
-            }
-
-            Current = updated;
-            Active = Math.Abs(Current - 1f) > 0.001f;
-
-            // The animation follows the new speed as well.
-            //
-            // This was removed in an attempt to fix the put-away animation replaying, on the theory
-            // that changing the speed mid-heal restarted the clip. The glitch carried on happening
-            // without it, so the removal fixed nothing and cost mid-heal animation response.
-            // Restored on that basis.
-            ApplyAnimatorSpeed();
+            _currentEffect = effect;
         }
 
-        /// <summary>
-        /// The med effect currently being applied, found by asking the health controller.
-        ///
-        /// Used by Retarget only. The per-body-part path takes the effect straight from
-        /// DoMedEffect's return value, which is more reliable, but that value is not available
-        /// here - a stance change happens outside that call.
-        /// </summary>
-        private static ActiveHealthController.MedEffect FindActiveMedEffect(Player player)
+        private static bool IsExactOwnedEffectLive(ActiveHealthController.MedEffect effect)
+        {
+            var health = _ownerPlayer?.ActiveHealthController;
+            if (health == null || effect == null)
+                return false;
+
+            foreach (var candidate in health.GetAllActiveEffects())
+            {
+                if (ReferenceEquals(candidate, effect))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static ActiveHealthController.MedEffect FindOwnedMedEffect(Player player, Item item)
         {
             var health = player?.ActiveHealthController;
-            if (health == null) return null;
+            if (health == null || item == null)
+                return null;
 
-            foreach (var effect in health.GetAllActiveEffects())
+            foreach (var candidate in health.GetAllActiveEffects())
             {
-                if (effect is ActiveHealthController.MedEffect med && med.Active) return med;
+                if (candidate is not ActiveHealthController.MedEffect med || !med.Existing)
+                    continue;
+
+                if (med.MedItem == null)
+                    continue;
+
+                if (ReferenceEquals(med.MedItem, item) || SameItemId(med.MedItem, item))
+                    return med;
             }
 
             return null;
         }
 
-        private static readonly FieldInfo StateTimeField =
-            AccessTools.Field(typeof(ActiveHealthController.Effect), "_stateTime");
-
-        /// <summary>
-        /// Changes a running effect's speed without changing how much it heals in total.
-        ///
-        /// The game's own IL shows why all three values must move together:
-        ///
-        ///   - NextState copies WorkStateTime into _stateTime ONCE, when the work state begins.
-        ///     After that _stateTime alone decides when the effect ends.
-        ///   - RegularUpdate computes each tick's healing as points * loopTime / WorkStateTime.
-        ///
-        /// So WorkStateTime is the RATE and _stateTime is the DURATION. Writing only WorkStateTime
-        /// mid-effect speeds the healing up without shortening the effect, and the item ends up
-        /// delivering the wrong amount of health.
-        ///
-        /// Total healed is points * (_stateTime / WorkStateTime). Keep those equal and the total is
-        /// exact at any speed - so both are set to the new duration, and the elapsed time is scaled
-        /// to preserve how far the heal had got.
-        /// </summary>
-        private static void Rescale(ActiveHealthController.Effect effect, float oldMultiplier, float newMultiplier)
+        private static void Rescale(
+            ActiveHealthController.MedEffect effect,
+            float oldMultiplier,
+            float newMultiplier)
         {
-            if (StateTimeField == null) return;
+            if (effect == null || effect.State != EEffectState.Started)
+            {
+                Debug($"RESCALE skipped state={effect?.State.ToString() ?? "null"}");
+                return;
+            }
 
-            var workTime = effect.WorkStateTime;
-            if (workTime <= 0f || newMultiplier <= 0f) return;
+            if (oldMultiplier <= 0f || newMultiplier <= 0f)
+                return;
 
-            var progress = Mathf.Clamp01(effect.StateCurrentTime / workTime);
+            float oldWork = effect.WorkStateTime;
+            if (oldWork <= Epsilon || float.IsInfinity(oldWork) || float.IsNaN(oldWork))
+                return;
 
-            var rescaled = workTime * (oldMultiplier / newMultiplier);
-            if (rescaled <= 0f) return;
+            float elapsed = Mathf.Clamp(effect.StateCurrentTime, 0f, oldWork);
+            float progress = Mathf.Clamp01(elapsed / oldWork);
+            float ratio = oldMultiplier / newMultiplier;
+            float newWork = Math.Max(0f, oldWork * ratio);
+            float newElapsed = progress * newWork;
+            float newRemaining = Math.Max(0f, newWork - newElapsed);
 
-            effect.WorkStateTime = rescaled;
-            StateTimeField.SetValue(effect, rescaled);
-            effect.StateCurrentTime = progress * rescaled;
+            // Preserve treatment progress, then use EFT's own AddWorkTime(reset:true) path to set
+            // the new state total. Unlike writing _stateTime directly, AddWorkTime emits the
+            // EffectStateTime network packet, so Fika peers receive the new remaining duration.
+            effect.StateCurrentTime = newElapsed;
+            effect.AddWorkTime(newRemaining, true);
+
+            Debug(
+                $"RESCALE Started ratio={ratio:0.000} progress={progress:0.000} " +
+                $"work={oldWork:0.000}->{effect.WorkStateTime:0.000} elapsed={elapsed:0.000}->{effect.StateCurrentTime:0.000} " +
+                $"remaining={newRemaining:0.000}");
+        }
+
+        private static void ApplyAnimatorSpeed(Player.MedsController controller, float value, string source)
+        {
+            var animator = controller?.FirearmsAnimator;
+            if (animator == null)
+            {
+                Debug($"ANIM skipped null animator source={source}");
+                return;
+            }
+
+            value = Mathf.Clamp(value, MinMultiplier, MaxMultiplier);
+
+            // Returning to vanilla multiplier means QuickMeds should release animator ownership,
+            // restoring whatever value existed before we touched it. Do not assume that baseline
+            // was 1.0: another compatible mod may legitimately own a different value.
+            if (Math.Abs(value - 1f) <= Epsilon)
+            {
+                if (_animatorSpeedApplied)
+                    RestoreAnimatorIfOwned($"target-vanilla:{source}");
+                else
+                    Debug($"ANIM no-write vanilla source={source} reads={ReadAnimatorSpeed(controller):0.000}");
+                return;
+            }
+
+            if (!_animatorSpeedApplied)
+            {
+                float current = ReadAnimatorSpeed(controller);
+                _animatorBaseline = current > 0f && !float.IsNaN(current) && !float.IsInfinity(current) ? current : 1f;
+            }
+            else if (Math.Abs(_lastAnimatorWrite - value) <= Epsilon)
+            {
+                Debug($"ANIM no-write unchanged source={source} value={value:0.000}");
+                return;
+            }
+
+            animator.SetAnimationSpeed(value);
+            _lastAnimatorWrite = value;
+            _animatorSpeedApplied = true;
+
+            Debug(
+                $"ANIM write source={source} set={value:0.000} reads={ReadAnimatorSpeed(controller):0.000} " +
+                $"baseline={_animatorBaseline:0.000} controller={Id(controller)} item={ItemName()}");
+        }
+
+        private static void RestoreAnimatorIfOwned(string source)
+        {
+            if (!_animatorSpeedApplied)
+                return;
+
+            var controller = _controller;
+            var animator = controller?.FirearmsAnimator;
+            if (animator == null)
+            {
+                _animatorSpeedApplied = false;
+                Debug($"ANIM restore skipped null animator source={source}");
+                return;
+            }
+
+            float current = ReadAnimatorSpeed(controller);
+
+            // If another mod changed Animator.speed after our last write, do not stomp its value.
+            // We only restore when the animator still contains the value QuickMeds last owned.
+            if (Math.Abs(current - _lastAnimatorWrite) <= 0.01f)
+            {
+                animator.SetAnimationSpeed(_animatorBaseline);
+                Debug(
+                    $"ANIM restore source={source} {_lastAnimatorWrite:0.000}->{_animatorBaseline:0.000} " +
+                    $"reads={ReadAnimatorSpeed(controller):0.000}");
+            }
+            else
+            {
+                Debug(
+                    $"ANIM restore ownership lost source={source} current={current:0.000} " +
+                    $"lastQuickMeds={_lastAnimatorWrite:0.000}; no write performed");
+            }
+
+            _animatorSpeedApplied = false;
+            _animatorBaseline = 1f;
+            _lastAnimatorWrite = 1f;
+        }
+
+        public static Player.MedsController GetOperationController(
+            Player.MedsController.MedsInHandsOperation operation)
+        {
+            return operation == null
+                ? null
+                : OperationControllerField?.GetValue(operation) as Player.MedsController;
+        }
+
+        public static void ClearIfOwner(Player.MedsController controller, string reason)
+        {
+            try
+            {
+                if (controller == null)
+                {
+                    Debug($"CLEAR ignored reason={reason}: captured controller unavailable");
+                    return;
+                }
+
+                if (!ReferenceEquals(controller, _controller))
+                {
+                    Debug($"CLEAR ignored foreign controller reason={reason} got={Id(controller)} owner={Id(_controller)}");
+                    return;
+                }
+
+                ClearInternal(reason);
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogSource?.LogError($"QuickMeds: owner-aware teardown failed ({reason}).\n{ex}");
+            }
+        }
+
+        private static void ClearInternal(string reason)
+        {
+            Debug(
+                $"CLEAR reason={reason} controller={Id(_controller)} item={ItemName()} " +
+                $"effect={(_currentEffect == null ? "null" : EffectSummary(_currentEffect))} mult={Current:0.00}");
+
+            RestoreAnimatorIfOwned($"clear:{reason}");
+            HealAutoCancel.Unwatch(reason);
+
+            Current = 1f;
+            _effectMultiplier = 1f;
+            _currentEffect = null;
+            _awaitingEffect = false;
+            _item = null;
+            _controller = null;
+            _ownerPlayer = null;
+        }
+
+        private static float ReadAnimatorSpeed(Player.MedsController controller)
+        {
+            return controller?.FirearmsAnimator?.Animator?.speed ?? -1f;
+        }
+
+        private static string ItemName()
+        {
+            return _item?.TemplateId.ToString() ?? "none";
+        }
+
+        private static string MovementName(Player player)
+        {
+            return player?.MovementContext?.CurrentState?.Name.ToString() ?? "?";
+        }
+
+        private static string EffectSummary(ActiveHealthController.MedEffect effect)
+        {
+            if (effect == null)
+                return "null";
+
+            return $"id={effect.Id} state={effect.State} body={effect.BodyPart} " +
+                   $"delay={effect.DelayTime:0.000} work={effect.WorkStateTime:0.000} " +
+                   $"stateTime={effect.StateTime:0.000} elapsed={effect.StateCurrentTime:0.000} " +
+                   $"item={effect.MedItem?.TemplateId.ToString() ?? "null"}";
+        }
+
+        private static string Id(object value)
+        {
+            return value == null ? "null" : RuntimeHelpers.GetHashCode(value).ToString("X8");
+        }
+
+        private static void Debug(string message)
+        {
+            if (Plugin.LogHealSpeed)
+                Plugin.LogSource?.LogInfo("QuickMedsDBG: " + message);
         }
     }
 
     /// <summary>
-    /// Captures the effect DoMedEffect just created, and scales its duration.
-    ///
-    /// Hooking the return value here rather than searching for the effect afterwards is what makes
-    /// this work for every med rather than only surgery kits.
+    /// Samples local ownership and movement before EFT starts the next body-part application.
     /// </summary>
-    internal class DoMedEffectPatch : ModulePatch
-    {
-        private static bool _reported;
-
-        protected override MethodBase GetTargetMethod()
-        {
-            return AccessTools.Method(
-                typeof(ActiveHealthController), nameof(ActiveHealthController.DoMedEffect));
-        }
-
-        [PatchPostfix]
-        private static void Postfix(Item item, IHealthEffect __result)
-        {
-            try
-            {
-                if (__result is not ActiveHealthController.MedEffect effect) return;
-
-                HealSpeed.CaptureEffect(effect);
-
-                if (Plugin.LogHealSpeed)
-                {
-                    Plugin.LogSource?.LogInfo(
-                        $"QuickMeds: effect created for {item?.TemplateId.ToString() ?? "?"} " +
-                        $"mult={HealSpeed.Current:0.00} work={effect.WorkStateTime:0.00} " +
-                        $"scalable={HealSpeed.HasApplicationDuration(item)}");
-                }
-
-                if (!HealSpeed.Active) return;
-
-                // Pills and injectors keep their timing: their work time is the buff duration.
-                // Food and drink never reach here, having been excluded in Begin.
-                if (!HasApplicationDuration(item)) return;
-
-                var before = effect.WorkStateTime;
-                var beforeDelay = effect.DelayTime;
-
-                // Safe to set WorkStateTime alone at this point: NextState has not yet copied it
-                // into _stateTime, so the duration picks the new value up on its own. Only
-                // mid-heal changes need all three set together - see HealSpeed.Rescale.
-                effect.WorkStateTime /= HealSpeed.Current;
-
-                // The start delay is scaled too, or the action is inconsistent with itself.
-                //
-                // Before healing begins the game waits out a delay that varies by item type - a
-                // medkit's is noticeably long. Scaling only the healing left the animation running
-                // fast while the delay still took its full time, so the item moved quickly, then
-                // paused, then finally started healing. Worst on a Grizzly, which has the longest
-                // wait.
-                //
-                // DelayTime is per-effect rather than a global setting, so this affects only the
-                // heal in progress. Safe here because the effect has not started ticking yet -
-                // elapsed time is still zero, so there is no risk of skipping past a delay that is
-                // already part-way through.
-                effect.DelayTime /= HealSpeed.Current;
-
-                if (Plugin.LogHealSpeed)
-                {
-                    Plugin.LogSource?.LogInfo(
-                        $"QuickMeds: work {before:0.00} -> {effect.WorkStateTime:0.00} " +
-                        $"delay {beforeDelay:0.00} -> {effect.DelayTime:0.00}");
-                }
-            }
-            catch (Exception ex)
-            {
-                if (!_reported)
-                {
-                    _reported = true;
-                    Plugin.LogSource?.LogError(
-                        $"QuickMeds: adjusting heal duration failed, adaptive speed is off: {ex.Message}");
-                }
-
-                Plugin.DisableAdaptiveHealSpeed();
-                HealSpeed.Clear();
-            }
-        }
-
-        private static bool HasApplicationDuration(Item item) => HealSpeed.HasApplicationDuration(item);
-    }
-
-    /// <summary>Samples the speed at the start of each body part.</summary>
     internal class HealSpeedPatch : ModulePatch
     {
-        private static readonly FieldInfo ControllerField =
-            AccessTools.Field(typeof(Player.MedsController.MedsInHandsOperation), "_controller");
-
         private static readonly FieldInfo PlayerField =
             AccessTools.Field(typeof(Player.ItemHandsController), "_player");
 
@@ -519,20 +697,69 @@ namespace QuickMeds.Patches
         [PatchPrefix]
         private static void Prefix(Player.MedsController.MedsInHandsOperation __instance)
         {
-            var controller = ControllerField?.GetValue(__instance) as Player.MedsController;
-            var player = controller == null ? null : PlayerField?.GetValue(controller) as Player;
-
-            // Sampled BEFORE the original runs, so DoMedEffect's postfix already has the right
-            // multiplier when the effect is created.
-            HealSpeed.Begin(player, controller);
+            try
+            {
+                var controller = HealSpeed.GetOperationController(__instance);
+                var player = controller == null ? null : PlayerField?.GetValue(controller) as Player;
+                HealSpeed.Begin(player, controller);
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogSource?.LogError($"QuickMeds: heal-session prefix failed.\n{ex}");
+            }
         }
     }
 
     /// <summary>
-    /// Scales the animation, and records the game's own factor for later re-application.
-    ///
-    /// The parameter MUST be named "speed" - Harmony binds prefix parameters by name against the
-    /// target signature, SetUseTimeMultiplier(float speed).
+    /// Applies the requested multiplier at MedEffect.Started. EFT's initial Added/start-delay phase
+    /// remains vanilla 1.0x; then work timing and animation change together through public/network-aware APIs.
+    /// </summary>
+    internal class MedEffectStartedPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod()
+        {
+            return AccessTools.DeclaredMethod(typeof(ActiveHealthController.MedEffect), "Started");
+        }
+
+        [PatchPostfix]
+        private static void Postfix(ActiveHealthController.MedEffect __instance)
+        {
+            HealSpeed.OnEffectStarted(__instance);
+        }
+    }
+
+    /// <summary>
+    /// Captures only the exact local MedEffect returned by DoMedEffect. Timing is applied safely at
+    /// MedEffect.Started; this hook keeps exact item/effect ownership and provides a zero-delay fallback.
+    /// </summary>
+    internal class DoMedEffectPatch : ModulePatch
+    {
+        protected override MethodBase GetTargetMethod()
+        {
+            return AccessTools.Method(typeof(ActiveHealthController), nameof(ActiveHealthController.DoMedEffect));
+        }
+
+        [PatchPostfix]
+        private static void Postfix(
+            ActiveHealthController __instance,
+            Item item,
+            IHealthEffect __result)
+        {
+            try
+            {
+                if (__result is ActiveHealthController.MedEffect effect)
+                    HealSpeed.CaptureEffect(__instance, item, effect);
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogSource?.LogError($"QuickMeds: MedEffect capture failed.\n{ex}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Diagnostic-only observer for EFT's own SetUseTimeMultiplier. QuickMeds does not change this
+    /// value, avoiding the old double-multiplication (e.g. 2.5 x 2.5 = 6.25) failure.
     /// </summary>
     internal class UseTimeMultiplierPatch : ModulePatch
     {
@@ -542,41 +769,16 @@ namespace QuickMeds.Patches
         }
 
         [PatchPrefix]
-        private static void Prefix(ref float speed)
+        private static void Prefix(FirearmsAnimator __instance, float speed)
         {
-            if (!HealSpeed.Active) return;
+            if (!Plugin.LogHealSpeed || !HealSpeed.OwnsAnimator(__instance))
+                return;
 
-            var before = speed;
-
-            // The multiplier is applied through ONE mechanism, not two.
-            //
-            // There are two ways to speed up the animation, and this mod was using both:
-            //
-            //   SetUseTimeMultiplier - sets an animator float parameter. Only has an effect if the
-            //                          animation controller was authored to read it, which appears
-            //                          to be true for surgery animations and not for others.
-            //   SetAnimationSpeed    - sets Animator.speed directly. Works on everything.
-            //
-            // Where both are honoured they multiply together: 2.5 x 2.5 = 6.25. That is the surgery
-            // kit animation running several times too fast, finishing early, and leaving the hands
-            // off screen waiting for the healing to catch up. Other items were unaffected only
-            // because the parameter did nothing for them.
-            //
-            // The value is deliberately passed through UNCHANGED. Only the playback-speed path
-            // scales the animation now; scaling here as well is what produced the runaway surgery
-            // animation. Logged anyway, because seeing what the game itself passes is useful when
-            // something looks wrong.
-            if (Plugin.LogHealSpeed)
-            {
-                Plugin.LogSource?.LogInfo($"QuickMeds: anim-mult game={before:0.00} (passed through)");
-            }
+            Plugin.LogSource?.LogInfo($"QuickMedsDBG: USETIME game={speed:0.000} passed-through");
         }
     }
 
-    /// <summary>
-    /// Re-evaluates speed when the player starts or stops moving. Event-driven, so a whole heal
-    /// costs a few calls rather than one per frame.
-    /// </summary>
+    /// <summary>Event-driven movement retargeting; local player only.</summary>
     internal class MovementStateChangedPatch : ModulePatch
     {
         protected override MethodBase GetTargetMethod()
@@ -589,13 +791,12 @@ namespace QuickMeds.Patches
         {
             try
             {
-                if (!ModEnvironment.IsLocalLivingPlayer(__instance)) return;
-
-                HealSpeed.Retarget(__instance);
+                if (ModEnvironment.IsLocalLivingPlayer(__instance))
+                    HealSpeed.Retarget(__instance, "movement");
             }
             catch (Exception ex)
             {
-                Plugin.LogSource?.LogWarning($"QuickMeds: could not retarget heal speed: {ex.Message}");
+                Plugin.LogSource?.LogError($"QuickMeds: movement retarget hook failed.\n{ex}");
             }
         }
     }
